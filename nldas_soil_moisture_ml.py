@@ -3,6 +3,7 @@ from __future__ import print_function
 from collections import OrderedDict
 import datetime
 from functools import partial
+import getpass
 import os
 
 import dill
@@ -39,8 +40,8 @@ PREDICTOR_COLS = None # Set this to a list to use only a subset of FORA DataArra
 START_DATE = datetime.datetime(2000, 1, 1, 1, 0, 0)
 
 def get_session():
-    username = os.environ.get('NLDAS_USERNAME', raw_input('NLDAS Username: '))
-    password = os.environ.get('NLDAS_PASSWORD', getpass.getpass('Password: '))
+    username = os.environ.get('NLDAS_USERNAME') or raw_input('NLDAS Username: ')
+    password = os.environ.get('NLDAS_PASSWORD') or getpass.getpass('Password: ')
     session = setup_session(username, password)
     return session
 
@@ -270,7 +271,7 @@ def ensemble_init_func(pipe, **kw):
     weights_kw_choices = kw['weights_kw']
     for weights_kw in weights_kw_choices:
         for diff_kw in diff_avg_hyper_params:
-            for s_label_0, scale_0 in scalers:
+            for s_label, scale in scalers:
                 for n_c in n_components:
                     for e_label, estimator in estimators:
                         scale_step = [scale] if scale else []
