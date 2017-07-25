@@ -429,11 +429,11 @@ def avg_arrs(*arrs):
     return s
 
 
-def differencing_integrating(X, y=None, sample_weight=None, **kw):
+def differencing_integrating(X, y=None, sample_weight=None,
+                             difference_cols=None,
+                             X_time_steps=None,
+                             X_time_averaging=None):
 
-    X_time_steps = kw['X_time_steps']
-    difference_cols = kw['difference_cols']
-    X_time_averaging = kw['X_time_averaging']
     X = X.copy(deep=True)
     X.attrs['band_order'] = X.band_order[:]
     new_X = OrderedDict([(k, getattr(X, k)) for k in X.data_vars
@@ -492,31 +492,34 @@ def add_sample_weight(X, y=None, sample_weight=None, **kw):
 pipeline_kw = dict(scoring=make_scorer(r_squared_mse))
 flat_step = ('flatten', steps.Flatten())
 drop_na_step = ('drop_null', steps.DropNaRows())
-diff_in_time = lambda kw: ('diff', steps.ModifySample(differencing_integrating, **kw))
+
 get_y_step = ('get_y', steps.ModifySample(partial(get_y, SOIL_MOISTURE)))
-robust = lambda: ('normalize', steps.RobustScaler(with_centering=False))
-standard = lambda: ('normalize', steps.StandardScaler(with_mean=False))
+robust = ('normalize', steps.RobustScaler(with_centering=False))
+standard = ('normalize', steps.StandardScaler(with_mean=False))
 minmax = lambda minn, maxx: ('minmax',
                              steps.MinMaxScaler(feature_range=(minn, maxx)))
-weights = lambda kw: ('weights', steps.ModifySample(add_sample_weight(**kw)))
 log = ('log', steps.ModifySample(log_scaler))
 def preamble(diff_kw, weights_kw):
-    return [diff_in_time(**diff_kw),
+    ms = steps.ModifySample(differencing_integrating, **diff_kw)
+    diff_in_time = ('diff', ms)
+    wts = ('weights', steps.ModifySample(add_sample_weight, **weights_kw))
+    return [diff_in_time,
             flat_step,
             drop_na_step,
             get_y_step,
-            weights(**weights_kw),]
+            wts,]
 
 linear = lambda: ('estimator', LinearRegression(n_jobs=-1))
 pca = lambda: ('pca', steps.Transform(PCA()))
 n_components = [None, 4, 6, 8, 10]
 minmax_bounds = [(0.01, 1.01), (0.05, 1.05),
-                 (0.1, 1.1), (0.2, 1.2),  (1, 2),]
+                 (0.1, 1.1), (0.2, 1.2),
+                 (1, 2),]
 minmax_scalers = [('MinMaxScaler', minmax(mn, mx))
                   for mn, mx in minmax_bounds]
 other_scalers = [('RobustScaler', robust),
                  ('StandardScaler', standard),
-                 None]
+                 ('None', None)]
 scalers = minmax_scalers + other_scalers
 estimators = zip(('LinearRegression', ),
                  (linear, ))
