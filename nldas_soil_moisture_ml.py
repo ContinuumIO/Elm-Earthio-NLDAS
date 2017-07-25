@@ -29,7 +29,6 @@ NSTEPS = 1
 WATER_MASK = -9999
 
 X_TIME_STEPS = 144
-X_TIME_AVERAGING = [0, 3, 6, 9, 12, 18, 24, 36, 48] + list(range(72, X_TIME_STEPS, 24))
 
 BASE_URL = 'https://hydro1.gesdisc.eosdis.nasa.gov/data/NLDAS/{}/{:04d}/{:03d}/{}'
 
@@ -40,8 +39,10 @@ PREDICTOR_COLS = None # Set this to a list to use only a subset of FORA DataArra
 START_DATE = datetime.datetime(2000, 1, 1, 1, 0, 0)
 
 def get_session():
-    u, p = os.environ['NLDAS_USER'], os.environ['NLDAS_PASS']
-    return setup_session(u, p)
+    username = os.environ.get('NLDAS_USERNAME', raw_input('NLDAS Username: '))
+    password = os.environ.get('NLDAS_PASSWORD', getpass.getpass('Password: '))
+    session = setup_session(username, password)
+    return session
 
 SESSION = get_session()
 
@@ -264,45 +265,36 @@ def ensemble_init_func(pipe, **kw):
     estimators = kw['estimators']
     preamble = kw['preamble']
     summary_template = kw['summary']
-    minmax_bounds = kw['minmax_bounds']
     log = kw['log']
-
-    for s_label_0, scale_0 in scalers:
-        if 'MinMax' in s_label_0:
-            # Make MinMaxScaler objects
-            labels = [s_label_0 + repr(mb) for mb in minmax_bounds]
-            scalers_with_params = [scale_0(*mb) for mb in minmax_bounds]
-            scalers_with_params = zip(labels, scalers_with_params)
-        elif scale_0:
-            # Just keep the StandardScaler as is
-            scalers_with_params = [(s_label_0, scale_0())]
-        else:
-            # No scaling
-            scalers_with_params = [(s_label_0, None)]
-        for s_label, scale in scalers_with_params:
-            for n_c in n_components:
-                for e_label, estimator in estimators:
-                    scale_step = [scale] if scale else []
-                    if 'MinMax' in s_label:
-                        # Log transform only works with MinMaxScaler
-                        # and positive min bound
-                        scale_step += [log]
-                    pca_step = [pca()] if n_c and scale else []
-                    new = Pipeline(preamble() +
-                                   scale_step +
-                                   pca_step +
-                                   [estimator()],
-                                   **pipeline_kw)
-                    if pca_step:
-                        new.set_params(pca__n_components=n_c)
-                        msg = '{} components'.format(n_c)
-                    else:
-                        msg = ' (None)'
-                    args = (s_label, msg, e_label)
-                    summary = ': Scaler: {} PCA: {} Estimator: {}'.format(*args)
-                    new.summary = summary_template + summary
-                    print(new.summary)
-                    ensemble.append(new)
+    diff_avg_hyper_params = kw['diff_avg_hyper_params']
+    weights_kw_choices = kw['weights_kw']
+    for weights_kw in weights_kw_choices:
+        for diff_kw in diff_avg_hyper_params:
+            for s_label_0, scale_0 in scalers:
+                for n_c in n_components:
+                    for e_label, estimator in estimators:
+                        scale_step = [scale] if scale else []
+                        if 'MinMax' in s_label:
+                            # Log transform only works with MinMaxScaler
+                            # and positive min bound
+                            scale_step += [log]
+                        pca_step = [pca()] if n_c and scale else []
+                        pre = preamble(diff_kw, weights_kw)
+                        new = Pipeline(pre +
+                                       scale_step +
+                                       pca_step +
+                                       [estimator()],
+                                       **pipeline_kw)
+                        if pca_step:
+                            new.set_params(pca__n_components=n_c)
+                            msg = '{} components'.format(n_c)
+                        else:
+                            msg = ' (None)'
+                        args = (s_label, msg, e_label)
+                        summary = ': Scaler: {} PCA: {} Estimator: {}'.format(*args)
+                        new.summary = summary_template + summary
+                        print(new.summary)
+                        ensemble.append(new)
     return ensemble
 
 
@@ -490,6 +482,8 @@ def add_sample_weight(X, y=None, sample_weight=None, **kw):
     if needed.  sample_weight returned should be a 1-D
     NumPy array.  Currently it is weighting the pos/neg deviations.
     '''
+    if kw.get('no_weights'):
+        return X, y, None
     sample_weight = np.abs((y - y.mean()) / y.std())
     return X, y, sample_weight
 
@@ -497,35 +491,56 @@ def add_sample_weight(X, y=None, sample_weight=None, **kw):
 pipeline_kw = dict(scoring=make_scorer(r_squared_mse))
 flat_step = ('flatten', steps.Flatten())
 drop_na_step = ('drop_null', steps.DropNaRows())
-kw = dict(X_time_steps=X_TIME_STEPS,
-          X_time_averaging=X_TIME_AVERAGING,
-          difference_cols=DIFFERENCE_COLS)
-
-diff_in_time = ('diff', steps.ModifySample(differencing_integrating, **kw))
+diff_in_time = lambda kw: ('diff', steps.ModifySample(differencing_integrating, **kw))
 get_y_step = ('get_y', steps.ModifySample(partial(get_y, SOIL_MOISTURE)))
 robust = lambda: ('normalize', steps.RobustScaler(with_centering=False))
 standard = lambda: ('normalize', steps.StandardScaler(with_mean=False))
 minmax = lambda minn, maxx: ('minmax',
                              steps.MinMaxScaler(feature_range=(minn, maxx)))
-minmax_bounds = [(0.01, 1.01), (0.05, 1.05),
-                 (0.1, 1.1), (0.2, 1.2),  (1, 2),]
-weights = ('weights', steps.ModifySample(add_sample_weight))
+weights = lambda kw: ('weights', steps.ModifySample(add_sample_weight(**kw)))
 log = ('log', steps.ModifySample(log_scaler))
-preamble = lambda: [diff_in_time,
-                    flat_step,
-                    drop_na_step,
-                    get_y_step,
-                    weights,]
+def preamble(diff_kw, weights_kw):
+    return [diff_in_time(**diff_kw),
+            flat_step,
+            drop_na_step,
+            get_y_step,
+            weights(**weights_kw),]
 
 linear = lambda: ('estimator', LinearRegression(n_jobs=-1))
 pca = lambda: ('pca', steps.Transform(PCA()))
 n_components = [None, 4, 6, 8, 10]
-scalers = zip(('MinMaxScaler', 'RobustScaler',
-               'StandardScaler', 'None'),
-              (minmax, robust, standard, None))
+minmax_bounds = [(0.01, 1.01), (0.05, 1.05),
+                 (0.1, 1.1), (0.2, 1.2),  (1, 2),]
+minmax_scalers = [('MinMaxScaler', minmax(mn, mx))
+                  for mn, mx in minmax_bounds]
+other_scalers = [('RobustScaler', robust),
+                 ('StandardScaler', standard),
+                 None]
+scalers = minmax_scalers + other_scalers
 estimators = zip(('LinearRegression', ),
                  (linear, ))
 
+tsteps_choices = [24, 48, 96, 144]
+few_days_ago = list(range(72, X_TIME_STEPS, 24))
+avg_scenario_0 = [0, 3, 6, 9, 12, 18, 24, 36, 48] + few_days_ago
+avg_scenario_1 = [0, 4, 8, 12, 18, 24, 36, 48] + few_days_ago
+avg_scenario_2 = [0, 6, 12, 24, 48] + few_days_ago
+avg_scenario_3 = [0, 2, 6, 12, 24, 48] + few_days_ago
+avg_scenario_4 = [0, 2, 12, 24, 72, few_days_ago[-1]]
+avg_scenario_5 = [0, 2, 24, 48] + few_days_ago
+avg_scenario_6 = [0, 6, 24, 48] + few_days_ago
+avg_scenarios = [avg_scenario_0,
+                 avg_scenario_1,
+                 avg_scenario_2,
+                 avg_scenario_3,
+                 avg_scenario_4,
+                 avg_scenario_5,
+                 avg_scenario_6,]
+diff_avg_hyper_params = [dict(X_time_steps=ts,
+                              X_time_averaging=[t for t in avg if t <= ts],
+                              difference_cols=DIFFERENCE_COLS)
+                         for ts in tsteps_choices
+                         for avg in avg_scenarios]
 
 def main():
     '''
@@ -546,8 +561,9 @@ def main():
                         estimators=estimators,
                         preamble=preamble,
                         log=log,
-                        minmax_bounds=minmax_bounds,
-                        summary='Flatten, Subset, Drop NaN Rows, Get Y Data, Difference X in Time')
+                        diff_avg_hyper_params=diff_avg_hyper_params,
+                        weights_kw=[dict(no_weights=True), dict()],
+                        summary='TODO fix')
     for step in range(NSTEPS):
         last_hour_data = sampler(date, X_time_steps=X_TIME_STEPS)
         date += add_hour
