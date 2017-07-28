@@ -431,9 +431,10 @@ def avg_arrs(*arrs):
 
 def differencing_integrating(X, y=None, sample_weight=None,
                              difference_cols=None,
-                             X_time_steps=None,
+                             X_time_steps=X_TIME_STEPS,
                              X_time_averaging=None):
-
+    if difference_cols is None:
+        difference_cols = DIFFERENCE_COLS
     X = X.copy(deep=True)
     X.attrs['band_order'] = X.band_order[:]
     new_X = OrderedDict([(k, getattr(X, k)) for k in X.data_vars
@@ -448,20 +449,20 @@ def differencing_integrating(X, y=None, sample_weight=None,
         for first_hr, second_hr in zip(X_time_averaging[:-1],
                                        X_time_averaging[1:]):
             for i in range(first_hr, second_hr):
-                old = 'hr_{}_{}'.format(first_hr, col)
-                new = 'hr_{}_{}'.format(second_hr, col)
-                old_array = X.data_vars[old]
-                new_array = X.data_vars[new]
-                running_fields.append(old_array)
-                diff = new_array - old_array
-                diff.attrs.update(new_array.attrs.copy())
+                end_period = 'hr_{}_{}'.format(first_hr, col)
+                start_period = 'hr_{}_{}'.format(second_hr, col)
+                end_array = X.data_vars[end_period]
+                start_array = X.data_vars[start_period]
+                running_fields.append(end_array)
+                diff = start_array - end_array
+                diff.attrs.update(start_array.attrs.copy())
                 running_diffs.append(diff)
             diff_col_name = 'diff_{}_{}_{}'.format(first_hr, second_hr, col)
             new_X[diff_col_name] = avg_arrs(*running_diffs)
             running_diffs = []
-            new_X[new] = avg_arrs(*running_fields)
+            new_X[start_period] = avg_arrs(*running_fields)
             running_fields = []
-            band_order.extend((diff_col_name, old))
+            band_order.extend((diff_col_name, end_period))
     X = xr.Dataset(new_X, attrs=X.attrs)
     X.attrs['band_order'] = band_order
     assert len(X.data_vars) == len(X.band_order), repr((len(X.data_vars), len(X.band_order)))
@@ -496,12 +497,14 @@ drop_na_step = ('drop_null', steps.DropNaRows())
 get_y_step = ('get_y', steps.ModifySample(partial(get_y, SOIL_MOISTURE)))
 robust = ('normalize', steps.RobustScaler(with_centering=False))
 standard = ('normalize', steps.StandardScaler(with_mean=False))
-minmax = lambda minn, maxx: ('minmax',
+minmax = lambda minn, maxx: ('MinMaxScaler',
                              steps.MinMaxScaler(feature_range=(minn, maxx)))
 log = ('log', steps.ModifySample(log_scaler))
-def preamble(diff_kw, weights_kw):
+def preamble(diff_kw=None, weights_kw=None):
+    diff_kw = diff_kw or {}
+    weights_kw = weights_kw or {}
     ms = steps.ModifySample(differencing_integrating, **diff_kw)
-    diff_in_time = ('diff', ms)
+    diff_in_time = ('diff_avg', ms)
     wts = ('weights', steps.ModifySample(add_sample_weight, **weights_kw))
     return [diff_in_time,
             flat_step,
@@ -515,8 +518,7 @@ n_components = [None, 4, 6, 8, 10]
 minmax_bounds = [(0.01, 1.01), (0.05, 1.05),
                  (0.1, 1.1), (0.2, 1.2),
                  (1, 2),]
-minmax_scalers = [('MinMaxScaler', minmax(mn, mx))
-                  for mn, mx in minmax_bounds]
+minmax_scalers = [minmax(mn, mx) for mn, mx in minmax_bounds]
 other_scalers = [('RobustScaler', robust),
                  ('StandardScaler', standard),
                  ('None', None)]
