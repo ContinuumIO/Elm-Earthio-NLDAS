@@ -24,14 +24,15 @@ SOIL_FILES = ('COS_RAWL',
               'TXDM1',
               'PCNTS',)
 
-BIN_FILES = ('NLDAS_Mosaic_soilparms.bin',
-             'NLDAS_STATSGOpredomsoil.bin',
-             'NLDAS_Noah_soilparms.bin',)
+BIN_FILE_META = {'NLDAS_Mosaic_soilparms.bin': '>f4',
+                 'NLDAS_STATSGOpredomsoil.bin': '>i4',
+                 'NLDAS_Noah_soilparms.bin': '>f4',
+                }
 SOIL_DIR = os.environ.get('SOIL_DATA', os.path.abspath('nldas_soil_inputs'))
 if not os.path.exists(SOIL_DIR):
     os.mkdir(SOIL_DIR)
 BIN_FILES = tuple(os.path.join(SOIL_DIR, 'bin', f)
-                  for f in BIN_FILES)
+                  for f in BIN_FILE_META)
 parts = SOIL_DIR, 'asc', 'soils', '*{}*'
 COS_HYD_FILES = {f: glob.glob(os.path.join(*parts).format(f))
                  for f in SOIL_FILES}
@@ -89,10 +90,21 @@ def _get_layer_num(fname):
     return int(x[ext].split('_')[-1])
 
 
-def read_ascii_groups(groups=None):
+def read_binary_files(coords, dims, attrs=None, bin_files=None):
+    bin_files = bin_files or tuple(BIN_FILES)
+    dsets = dsets or {}
+    arrs = {}
+    for f in bin_files:
+        basename = os.path.basename(f)
+        dtype = BIN_FILE_META.get(basename)
+        arr = np.fromfile(f, dtype=dtype)
+        arrs[basename] = xr.DataArray(arr, coords=coords, dims=dims, attrs=attrs)
+    return xr.Dataset(arrs)
+
+def read_ascii_groups(ascii_groups=None):
     dsets = {}
     to_concat_names = set()
-    for name in (groups or sorted(COS_HYD_FILES)):
+    for name in (ascii_groups or sorted(COS_HYD_FILES)):
         fs = COS_HYD_FILES[name]
         if name.startswith(('COS_', 'HYD_',)):
             names = SOIL_META['COS_HYD']
@@ -128,6 +140,21 @@ def read_ascii_groups(groups=None):
     return xr.Dataset(dsets)
 
 
+def read_nldas_soil_info(ascii_groups=None, bin_files=None):
+    if ascii_groups == False:
+        dset_ascii = read_ascii_groups(sorted(COS_HYD_FILES)[:1])
+    else:
+        for a in (ascii_groups or []):
+            if not a in COS_HYD_FILES:
+                raise ValueErrror('ascii_groups contains {} not in {}'.format(a, set(COS_HYD_FILES)))
+        dset_ascii = read_ascii_groups(ascii_groups)
+    example = tuple(dset_ascii.data_vars.keys())[0]
+    example = dset_ascii[example]
+    coords, dims = example.coords, example.dims
+    dset_bin = read_binary_files(coords, dims,
+                                 bin_files=bin_files)
+    return xr.merge((dset_bin, dset_ascii))
+
 def download_data(session=None):
     if session is None:
         from nldas_soil_moisture_ml import SESSION as session
@@ -162,5 +189,5 @@ def download_data(session=None):
 
 if __name__ == '__main__':
     download_data()
-    X = read_ascii_groups()
+    X = read_nldas_soil_info()
 
