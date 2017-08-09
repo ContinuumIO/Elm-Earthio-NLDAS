@@ -38,6 +38,7 @@ COS_HYD_FILES = {f: glob.glob(os.path.join(*parts).format(f))
                  for f in SOIL_FILES}
 
 NO_DATA = -9.99
+NO_DATA_BIN = -9999
 
 def dataframe_to_rasters(df,
                          col_attrs=None,
@@ -90,15 +91,35 @@ def _get_layer_num(fname):
     return int(x[ext].split('_')[-1])
 
 
-def read_binary_files(coords, dims, attrs=None, bin_files=None):
+def read_binary_files(y, x, attrs=None, bin_files=None):
     bin_files = bin_files or tuple(BIN_FILES)
-    dsets = dsets or {}
     arrs = {}
+    dims = 'y', 'x'
+    attrs = attrs or {}
+    coords = dict(y=y, x=x)
     for f in bin_files:
+        print('Reading', f)
         basename = os.path.basename(f)
+        name_token = basename.split('_')[1].split('predom')[0]
         dtype = BIN_FILE_META.get(basename)
-        arr = np.fromfile(f, dtype=dtype)
-        arrs[basename] = xr.DataArray(arr, coords=coords, dims=dims, attrs=attrs)
+        arr = np.fromfile(f, dtype=dtype).astype(np.float32)
+        arr[arr == NO_DATA_BIN] = np.NaN
+        if basename in SOIL_META:
+            names = SOIL_META[basename]
+            arr.resize(y.size, x.size, len(names))
+            for idx, (name, meta) in enumerate(names):
+                raster_name = '{}_{}'.format(name_token, name)
+                att = dict(filenames=[f], field=[name], meta=meta)
+                att.update(attrs.copy())
+                arrs[raster_name] = xr.DataArray(arr[:, :, idx],
+                                                 coords=coords,
+                                                 dims=dims, attrs=att)
+        else:
+            arr.resize(y.size, x.size)
+            att = dict(filenames=[f])
+            att.update(attrs.copy())
+            arrs[name_token] = xr.DataArray(arr, coords=coords,
+                                          dims=dims, attrs=att)
     return xr.Dataset(arrs)
 
 def read_ascii_groups(ascii_groups=None):
@@ -150,9 +171,8 @@ def read_nldas_soil_info(ascii_groups=None, bin_files=None):
         dset_ascii = read_ascii_groups(ascii_groups)
     example = tuple(dset_ascii.data_vars.keys())[0]
     example = dset_ascii[example]
-    coords, dims = example.coords, example.dims
-    dset_bin = read_binary_files(coords, dims,
-                                 bin_files=bin_files)
+    y, x, dims = example.y, example.x, example.dims
+    dset_bin = read_binary_files(y, x, bin_files=bin_files)
     return xr.merge((dset_bin, dset_ascii))
 
 def download_data(session=None):
