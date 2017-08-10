@@ -47,6 +47,18 @@ COS_HYD:
  - ["hy_cond", "Saturated Soil Hydraulic Conductivity (in m/s)"]
  - ["unknown", "Unknown"]
 
+NLDAS_Mosaic_soilparms.bin:
+ - ["smcmx1", "Mosaic soil layer 1 LSM maximum soil moisture content (porosity) [m^3 m-3]"]
+ - ["smcmx2", "Mosaic soil layer 2 LSM maximum soil moisture content (porosity) [m^3 m-3]"]
+ - ["smcmx3", "Mosaic soil layer 3 LSM maximum soil moisture content (porosity) [m^3 m-3]"]
+ - ["smcrf1", "Mosaic soil layer 1 LSM reference soil moisture content (field capacity) [m^3 m-3]"]
+ - ["smcrf2", "Mosaic soil layer 2 LSM reference soil moisture content (field capacity) [m^3 m-3]"]
+ - ["smcrf3", "Mosaic soil layer 3 LSM reference soil moisture content (field capacity) [m^3 m-3]"]
+ - ["smcwlt", "Mosaic LSM dry soil moisture content (wilting point) [m^3 m-3]"]
+ - ["smcbee", "Mosaic LSM Clapp-Hornberger 'b' parameter [non-dimensional]"]
+ - ["psisat", "Mosaic LSM saturated soil matric potential [meters of water]"]
+ - ["shcsat", "Mosaic LSM saturated soil hydraulic conductivity [m sec-1]"]
+
 TEXTURES:
  - [1, "S", "Sand"]
  - [2, "LS", "Loamy sand"]

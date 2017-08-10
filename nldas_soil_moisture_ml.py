@@ -1,4 +1,4 @@
-from __future__ import print_function
+from __future__ import print_function, unicode_literals, division
 
 from collections import OrderedDict
 import datetime
@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
+from soil_features import soil_features, avg_arrs
+
 VIC, FORA = ('NLDAS_VIC0125_H', 'NLDAS_FORA0125_H',)
 
 NGEN = 1
@@ -38,6 +40,8 @@ SOIL_MOISTURE = 'SOIL_M_110_DBLY'
 PREDICTOR_COLS = None # Set this to a list to use only a subset of FORA DataArrays
 
 START_DATE = datetime.datetime(2000, 1, 1, 1, 0, 0)
+
+ONE_HR = datetime.timedelta(hours=1)
 
 def get_session():
     username = os.environ.get('NLDAS_USERNAME') or raw_input('NLDAS Username: ')
@@ -171,6 +175,7 @@ def sampler(date, X_time_steps=144, **kw):
     Parameters:
         date: Datetime object on an integer hour - VIC and FORA are
               retrieved for this date
+        soil_features_kw: keywords passed to soil_features.soil_features
         X_time_steps: Number of preceding hours to include in sample
         **kw:  Ignored
 
@@ -199,7 +204,8 @@ def sampler(date, X_time_steps=144, **kw):
                                                        data_arrs=data_arrs,
                                                        keep_columns=PREDICTOR_COLS)
     attrs = dict(band_order=band_order)
-    return xr.Dataset(data_arrs, attrs=attrs)
+    weather = xr.Dataset(data_arrs, attrs=attrs)
+    return xr.merge((weather, SOIL_TYPES_PHYS))
 
 
 def get_y(y_field, X, y=None, sample_weight=None, **kw):
@@ -367,7 +373,8 @@ def ensemble_layer_2(pipe, **kw):
     return [Pipeline([RidgeCV()], **pipeline_kw)]
 
 
-def train_model_on_models(last_hour_data, this_hour_data, init_func):
+def train_model_on_models(last_hour_data, this_hour_data,
+                          init_func, nsga2_func=None):
     '''Given input NLDAS FORA data from last hour and this hour,
     train on the last hour and use the trained models to predict
     the current hour's soil moisture
@@ -397,10 +404,14 @@ def train_model_on_models(last_hour_data, this_hour_data, init_func):
         X_clean, true_y, _ = get_y(SOIL_MOISTURE,
                                    drop_na_rows(flatten(X)))
         if hour == 'last':
-            models = ensemble(None, ngen=NGEN, X=X,
-                              ensemble_init_func=init_func,
-                              model_selection=model_selection,
-                              model_selection_kwargs=dict(ensemble_init_func=init_func))
+            if nsga2_func:
+                models = nsga2_func()
+            else:
+                kw = dict(ensemble_init_func=init_func)
+                models = ensemble(None, ngen=NGEN, X=X,
+                                  ensemble_init_func=init_func,
+                                  model_selection=model_selection,
+                                  model_selection_kwargs=kw)
         else:
             preds = predict_many(dict(X=X),
                                  ensemble=models)
@@ -415,18 +426,6 @@ def train_model_on_models(last_hour_data, this_hour_data, init_func):
             preds2 = predict_many(dict(X=X_second),
                                   ensemble=models2)
     return last_hour_data, this_hour_data, models, preds, models2, preds2
-
-
-def avg_arrs(*arrs):
-    '''Take the mean of a variable number of xarray.DataArray objects and
-    keep metadata from the first DataArray given'''
-    s = arrs[0]
-    if len(arrs) > 1:
-        for a in arrs[1:]:
-            s += a
-    s = s / float(len(arrs))
-    s.attrs.update(arrs[0].attrs)
-    return s
 
 
 def differencing_integrating(X, y=None, sample_weight=None,
@@ -502,15 +501,16 @@ minmax = lambda minn, maxx: ('MinMaxScaler',
 log = ('log', steps.ModifySample(log_scaler))
 def preamble(diff_kw=None, weights_kw=None):
     diff_kw = diff_kw or {}
-    weights_kw = weights_kw or {}
     ms = steps.ModifySample(differencing_integrating, **diff_kw)
     diff_in_time = ('diff_avg', ms)
-    wts = ('weights', steps.ModifySample(add_sample_weight, **weights_kw))
-    return [diff_in_time,
+    pre = [diff_in_time,
             flat_step,
             drop_na_step,
-            get_y_step,
-            wts,]
+            get_y_step,]
+    if weights_kw is not None:
+        wts = ('weights', steps.ModifySample(add_sample_weight, **weights_kw))
+        return pre + [wts]
+    return pre
 
 linear = lambda: ('estimator', LinearRegression(n_jobs=-1))
 pca = lambda: ('pca', steps.Transform(PCA()))
@@ -527,6 +527,8 @@ estimators = zip(('LinearRegression', ),
                  (linear, ))
 
 tsteps_choices = [24, 48, 96, 144]
+# TODO turn this into a real valued
+# TODO
 few_days_ago = list(range(72, X_TIME_STEPS, 24))
 avg_scenario_0 = [0, 3, 6, 9, 12, 18, 24, 36, 48] + few_days_ago
 avg_scenario_1 = [0, 4, 8, 12, 18, 24, 36, 48] + few_days_ago
@@ -557,7 +559,6 @@ def main():
     a dill dump file for each hour run. Runs fro NSTEPS hour steps.
     '''
     date = START_DATE
-    add_hour = datetime.timedelta(hours=1)
     get_file_name = lambda date: date.isoformat(
                         ).replace(':','_').replace('-','_') + '.dill'
     init_func = partial(ensemble_init_func,
@@ -572,7 +573,7 @@ def main():
                         summary='TODO fix')
     for step in range(NSTEPS):
         last_hour_data = sampler(date, X_time_steps=X_TIME_STEPS)
-        date += add_hour
+        date += ONE_HR
         this_hour_data = sampler(date, X_time_steps=X_TIME_STEPS)
         current_file = get_file_name(date)
         out = train_model_on_models(last_hour_data, this_hour_data, init_func)

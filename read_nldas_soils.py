@@ -1,4 +1,5 @@
-from __future__ import print_function
+from __future__ import print_function, unicode_literals, division
+from collections import OrderedDict
 import glob
 import json
 import os
@@ -67,7 +68,7 @@ def dataframe_to_rasters(df,
 
 
 def read_ascii_grid(filenames, y, x, name, dsets=None):
-    dsets = dsets or {}
+    dsets = dsets or OrderedDict()
     template = np.empty((y.size, x.size, len(filenames)))
     coords = dict(y=y, x=x, layer=list(range(1, 1 + len(filenames))))
     dims = ('y', 'x', 'layer')
@@ -106,6 +107,8 @@ def read_binary_files(y, x, attrs=None, bin_files=None):
         arr[arr == NO_DATA_BIN] = np.NaN
         if basename in SOIL_META:
             names = SOIL_META[basename]
+            max_texture = np.max(tuple(_[0] for _ in SOIL_META['TEXTURES']))
+            arr[arr > max_texture] = np.NaN
             arr.resize(y.size, x.size, len(names))
             for idx, (name, meta) in enumerate(names):
                 raster_name = '{}_{}'.format(name_token, name)
@@ -119,11 +122,12 @@ def read_binary_files(y, x, attrs=None, bin_files=None):
             att = dict(filenames=[f])
             att.update(attrs.copy())
             arrs[name_token] = xr.DataArray(arr, coords=coords,
-                                          dims=dims, attrs=att)
+                                            dims=dims, attrs=att)
     return xr.Dataset(arrs)
 
+
 def read_ascii_groups(ascii_groups=None):
-    dsets = {}
+    dsets = OrderedDict()
     to_concat_names = set()
     for name in (ascii_groups or sorted(COS_HYD_FILES)):
         fs = COS_HYD_FILES[name]
@@ -161,7 +165,7 @@ def read_ascii_groups(ascii_groups=None):
     return xr.Dataset(dsets)
 
 
-def read_nldas_soil_info(ascii_groups=None, bin_files=None):
+def read_nldas_soils(ascii_groups=None, bin_files=None):
     if ascii_groups == False:
         dset_ascii = read_ascii_groups(sorted(COS_HYD_FILES)[:1])
     else:
@@ -174,6 +178,7 @@ def read_nldas_soil_info(ascii_groups=None, bin_files=None):
     y, x, dims = example.y, example.x, example.dims
     dset_bin = read_binary_files(y, x, bin_files=bin_files)
     return xr.merge((dset_bin, dset_ascii))
+
 
 def download_data(session=None):
     if session is None:
@@ -209,5 +214,5 @@ def download_data(session=None):
 
 if __name__ == '__main__':
     download_data()
-    X = read_nldas_soil_info()
+    X = read_nldas_soils()
 
