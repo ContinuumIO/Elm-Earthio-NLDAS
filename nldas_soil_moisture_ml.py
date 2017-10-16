@@ -3,589 +3,210 @@ from __future__ import print_function, unicode_literals, division
 from collections import OrderedDict
 import datetime
 from functools import partial
-import getpass
+from itertools import product
 import os
 
 import dill
-from earthio import Canvas, drop_na_rows, flatten
-from elm.pipeline import Pipeline, steps
-from elm.pipeline.ensemble import ensemble
+from elm.pipeline import Pipeline
+from elm.pipeline.steps import (linear_model,
+                                decomposition,
+                                gaussian_process,
+                                preprocessing)
 from elm.pipeline.predict_many import predict_many
-from pydap.cas.urs import setup_session
-from sklearn.decomposition import PCA
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.linear_model import (LinearRegression, SGDRegressor,
-                                  RidgeCV, Ridge)
 from sklearn.metrics import r2_score, mean_squared_error, make_scorer
 from elm.model_selection.sorting import pareto_front
-import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
+from elm.mldataset.cv_cache import CVCacheSampleId, cv_split
+from elm.model_selection import EaSearchCV
 import numpy as np
-import xarray as xr
+from xarray_filters import MLDataset
+from xarray_filters.pipeline import Generic, Step
 
-from soil_features import soil_features, avg_arrs
+from read_nldas_forcing import (slice_nldas_forcing_a,
+                                GetY, FEATURE_LAYERS,
+                                SOIL_MOISTURE)
+from nldas_soil_features import nldas_soil_features
+from ts_raster_steps import differencing_integrating
+from changing_structure import ChooseWithPreproc
 
-VIC, FORA = ('NLDAS_VIC0125_H', 'NLDAS_FORA0125_H',)
-
-NGEN = 1
+NGEN = 3
 NSTEPS = 1
-
 WATER_MASK = -9999
-
-X_TIME_STEPS = 144
-
-BASE_URL = 'https://hydro1.gesdisc.eosdis.nasa.gov/data/NLDAS/{}/{:04d}/{:03d}/{}'
-
-SOIL_MOISTURE = 'SOIL_M_110_DBLY'
-
-PREDICTOR_COLS = None # Set this to a list to use only a subset of FORA DataArrays
+DEFAULT_CV = 5
 
 START_DATE = datetime.datetime(2000, 1, 1, 1, 0, 0)
 
+DEFAULT_MAX_STEPS = 3
 ONE_HR = datetime.timedelta(hours=1)
-
-def get_session():
-    username = os.environ.get('NLDAS_USERNAME') or raw_input('NLDAS Username: ')
-    password = os.environ.get('NLDAS_PASSWORD') or getpass.getpass('Password: ')
-    session = setup_session(username, password)
-    return session
-
-SESSION = get_session()
+TIME_OPERATIONS = ('mean',
+                   'std',
+                   'sum',
+                   ('diff', 'mean'),
+                   ('diff', 'std'),
+                   ('diff', 'sum'))
+REDUCERS = [('mean', x) for x in TIME_OPERATIONS if x != 'mean']
 
 np.random.seed(42)  # TODO remove
 
-TOP_N_MODELS = 6
-MIN_MOISTURE_BOUND, MAX_MOISTURE_BOUND = -80, 2000
-MIN_R2 = 0.
-
-DIFFERENCE_COLS = [  # FORA DataArray's that may be differenced
-    'A_PCP_110_SFC_acc1h',
-    'PEVAP_110_SFC_acc1h',
-    'TMP_110_HTGL',
-    'DSWRF_110_SFC',
-    'PRES_110_SFC',
-    'DLWRF_110_SFC',
-    'V_GRD_110_HTGL',
-    'SPF_H_110_HTGL',
-    'U_GRD_110_HTGL',
-    'CAPE_110_SPDY',
-]
-
-def make_url(year, month, day, hour, dset, nldas_ver='002'):
-    '''For given date components, data set identifier,
-    and NLDAS version, return URL and relative path for a file
-
-    Returns:
-        url: URL on hydro1.gesdisc.eosdis.nasa.gov
-        rel: Relative path named like URL pattern
-    '''
-    start = datetime.datetime(year, 1, 1)
-    actual = datetime.datetime(year, month, day)
-    julian = int(((actual - start).total_seconds() / 86400) + 1)
-    vic_ver = '{}.{}'.format(dset, nldas_ver)
-    fname_pat = '{}.A{:04d}{:02d}{:02d}.{:04d}.{}.grb'.format(dset, year, month, day, hour * 100, nldas_ver)
-    url = BASE_URL.format(vic_ver, year, julian, fname_pat)
-    rel = os.path.join('{:04d}'.format(year),
-                       '{:03d}'.format(julian),
-                       fname_pat)
-    return url, rel
-
-
-def get_file(*args, **kw):
-    '''Pass date components and dset arguments to make_url and
-    download the file if needed.  Return the relative path
-    in either case
-
-    Parameters:
-        See make_url function above: Arguments are passed to that function
-
-    Returns:
-        rel:  Relative path
-    '''
-    url, rel = make_url(*args, **kw)
-    path, basename = os.path.split(rel)
-    if not os.path.exists(rel):
-        if not os.path.exists(path):
-            os.makedirs(path)
-        print('Downloading', url, 'to', rel)
-        r = SESSION.get(url)
-        with open(rel, 'wb') as f:
-            f.write(r.content)
-    return rel
-
-
-def nan_mask_water(arr, mask_value=WATER_MASK):
-    if np.any(arr.values == WATER_MASK):
-        raise ValueError(repr((arr, arr.attrs)))
-    arr.values[arr.values == mask_value] = np.NaN
-    return arr
-
-
-def get_nldas_fora_X_and_vic_y(year, month, day, hour,
-                           vic_or_fora, band_order=None,
-                           prefix=None, data_arrs=None,
-                           keep_columns=None):
-    '''Load data from VIC for NLDAS Forcing A Grib files
-
-    Parameters:
-        year: year of forecast time
-        month: month of forecast time
-        day: day of forecast time
-        vic_or_fora: string indicating which NLDAS data source
-        band_order: list of DataArray names already loaded
-        prefix: add a prefix to the DataArray name from Grib
-        data_arrs: Add the DataArrays to an existing dict
-        keep_columns: Retain only the DataArrays in this list, if given
-    Returns:
-        tuple or (data_arrs, band_order) where data_arrs is
-        an OrderedDict of DataArrays and band_order is their
-        order when they are flattened from rasters to a single
-        2-D matrix
-    '''
-    data_arrs = data_arrs or OrderedDict()
-    band_order = band_order or []
-    path = get_file(year, month, day, hour, dset=vic_or_fora)
-    dset = xr.open_dataset(path, engine='pynio')
-    for k in dset.data_vars:
-        if keep_columns and k not in keep_columns:
-            continue
-        arr = getattr(dset, k)
-        if sorted(arr.dims) != ['lat_110', 'lon_110']:
-            continue
-        #print('Model: ',f, 'Param:', k, 'Detail:', arr.long_name)
-        lon, lat = arr.lon_110, arr.lat_110
-        geo_transform = [lon.Lo1, lon.Di, 0.0,
-                         lat.La1, 0.0, lat.Dj]
-        shp = arr.shape
-        canvas = Canvas(geo_transform, shp[1], shp[0], arr.dims)
-        arr.attrs['canvas'] = canvas
-        if prefix:
-            band_name = '{}_{}'.format(prefix, k)
-        else:
-            band_name = k
-        data_arrs[band_name] = nan_mask_water(arr)
-        band_order.append(band_name)
-    return data_arrs, band_order
-
-
-def sampler(date, X_time_steps=144, **kw):
-    '''Sample the NLDAS Forcing A GriB file(s) for X_time_steps
-    and get a VIC data array from GriB for the current step to use
-    as Y data
-
-    Parameters:
-        date: Datetime object on an integer hour - VIC and FORA are
-              retrieved for this date
-        soil_features_kw: keywords passed to soil_features.soil_features
-        X_time_steps: Number of preceding hours to include in sample
-        **kw:  Ignored
-
-    Returns:
-        this_hour_data: xarray.Dataset
-    '''
-    year, month, day, hour = date.year, date.month, date.day, date.hour
-    data_arrs = OrderedDict()
-    band_order = []
-    forecast_time = datetime.datetime(year, month, day, hour, 0, 0)
-    data_arrs, band_order = get_nldas_fora_X_and_vic_y(year, month,
-                                                   day, hour,
-                                                   VIC, band_order=band_order,
-                                                   prefix=None,
-                                                   data_arrs=data_arrs,
-                                                   keep_columns=[SOIL_MOISTURE])
-    for hours_ago in range(X_time_steps):
-        file_time = forecast_time - datetime.timedelta(hours=hours_ago)
-        y, m = file_time.year, file_time.month
-        d, h = file_time.day, file_time.hour
-        data_arrs, band_order = get_nldas_fora_X_and_vic_y(y, m,
-                                                       d, h,
-                                                       FORA,
-                                                       band_order=band_order,
-                                                       prefix='hr_{}'.format(hours_ago),
-                                                       data_arrs=data_arrs,
-                                                       keep_columns=PREDICTOR_COLS)
-    attrs = dict(band_order=band_order)
-    weather = xr.Dataset(data_arrs, attrs=attrs)
-    return xr.merge((weather, SOIL_TYPES_PHYS))
-
-
-def get_y(y_field, X, y=None, sample_weight=None, **kw):
-    '''Get the VIC Y column out of a flattened Dataset
-    of FORA and VIC DataArrays'''
-    assert ('flat',) == tuple(X.data_vars)
-    y = X.flat[:, X.flat.band == y_field].values
-    flat = X.flat[:, X.flat.band != y_field]
-    X2 = xr.Dataset({'flat': flat}, attrs=X.attrs)
-    X2.attrs['canvas'] = X.flat.canvas
-    X2.attrs['band_order'].remove(y_field)
-    return X2, y, sample_weight
-
-
-def r_squared_mse(y_true, y_pred, sample_weight=None, multioutput=None):
-
-    r2 = r2_score(y_true, y_pred,
-                  sample_weight=sample_weight, multioutput=multioutput)
-    mse = mean_squared_error(y_true, y_pred,
-                             sample_weight=sample_weight,
-                             multioutput=multioutput)
-    bounds_check = np.min(y_pred) > MIN_MOISTURE_BOUND
-    bounds_check = bounds_check&(np.max(y_pred) < MAX_MOISTURE_BOUND)
-    print('Scoring - std', np.std(y_true), np.std(y_pred))
-    print('Scoring - median', np.median(y_true), np.median(y_pred))
-    print('Scoring - min', np.min(y_true), np.min(y_pred))
-    print('Scoring - max', np.max(y_true), np.max(y_pred))
-    print('Scoring - mean', np.mean(y_true), np.mean(y_pred))
-    print('Scoring - MSE, R2, bounds', mse, r2, bounds_check)
-    return (float(mse),
-            float(r2),
-            int(bounds_check))
-
-
-def ensemble_init_func(pipe, **kw):
-    '''Create an ensemble of regression models to predict soil moisture
-    where PCA, scaling, and/or log transformation may follow preamble
-    steps of flattening a Dataset and extracting the Y data, among other
-    preprocessors.
-
-    Parameters:
-        pipe: Ignored
-        **kw: Keyword arguments:
-            scalers: List of (name, scaler) tuples such as
-                     [('StandardScaler', steps.StandardScaler(with_mean=True)),
-                      ('RobustScaler', steps.RobustScaler(with_centering=True))]
-            n_components: List of PCA # of components to try. May include None
-                          if skipping PCA step
-            estimators: List of (name, estimator) tuples where estimator
-                        may be any scikit-learn-like regressor, e.g.
-                        [('estimator', LinearRegression())]
-            log:        Log transform step, e.g.:
-                        ('log', steps.ModifySample(log_scaler))
-            summary:    String summary of premable steps to prepend to
-                        parameter summary
-
-    Returns:
-        ensemble: List of Pipeline instances
-    '''
-    ensemble = []
-    scalers = kw['scalers']
-    n_components = kw['n_components']
-    pca = kw['pca']
-    estimators = kw['estimators']
-    preamble = kw['preamble']
-    summary_template = kw['summary']
-    log = kw['log']
-    diff_avg_hyper_params = kw['diff_avg_hyper_params']
-    weights_kw_choices = kw['weights_kw']
-    for weights_kw in weights_kw_choices:
-        for diff_kw in diff_avg_hyper_params:
-            for s_label, scale in scalers:
-                for n_c in n_components:
-                    for e_label, estimator in estimators:
-                        scale_step = [scale] if scale else []
-                        if 'MinMax' in s_label:
-                            # Log transform only works with MinMaxScaler
-                            # and positive min bound
-                            scale_step += [log]
-                        pca_step = [pca()] if n_c and scale else []
-                        pre = preamble(diff_kw, weights_kw)
-                        new = Pipeline(pre +
-                                       scale_step +
-                                       pca_step +
-                                       [estimator()],
-                                       **pipeline_kw)
-                        if pca_step:
-                            new.set_params(pca__n_components=n_c)
-                            msg = '{} components'.format(n_c)
-                        else:
-                            msg = ' (None)'
-                        args = (s_label, msg, e_label)
-                        summary = ': Scaler: {} PCA: {} Estimator: {}'.format(*args)
-                        new.summary = summary_template + summary
-                        print(new.summary)
-                        ensemble.append(new)
-    return ensemble
-
-
-_last_idx = 0
-def next_tag():
-    '''Make a tag for a model'''
-    global _last_idx
-    _last_idx += 1
-    return 'new_member_{}'.format(_last_idx)
-
-
-def model_selection(ensemble, **kw):
-    '''Pareto sort the ensemble by objective scores, keeping
-    TOP_N_MODELS best models and initializing new models
-    to keep the ensemble size constant.'''
-
-    # Get the MSE and R2 scores
-    scores = np.array([model._score[:-1] for _, model in ensemble])
-    # Minimization/maximization weights for MSE and R2 scores
-    wts = [-1, 1]
-    # Sort by Pareto optimality on MSE, R2 scores
-    ensemble = [ensemble[idx] for idx in pareto_front(wts, scores)]
-    # Apply some bounds checks:
-        # 1) R2 > 0.3 and
-        # 2) Minimum predicted soil moisture > -10
-    ensemble = [(tag, model) for tag, model in ensemble
-                if model._score[1] > MIN_R2 # min R**2 criterion
-                and model._score[2]]        # mostly postive criterion (moisture)
-                                            # and less than max possible
-    print('Scores:', [model._score for _, model in ensemble])
-    last_gen = kw['ngen'] - 1 == kw['generation']
-    if last_gen:
-        return ensemble[:TOP_N_MODELS]
-    new = kw['ensemble_init_func'](None)
-    np.random.shuffle(new)
-    new = [(next_tag(), model) for model in new]
-    np.random.shuffle(new)
-    return ensemble[:TOP_N_MODELS] + new[:len(ensemble) - TOP_N_MODELS]
-
-
-def second_layer_input_matrix(X, models):
-    '''Build a second layer model input matrix by taking the
-    metadata from X given to the first layer models and forming
-    a new matrix from the 1-D predictions of the first layer models
-    '''
-    preds = predict_many(dict(X=X), to_raster=False,
-                         ensemble=models)
-    example = preds[0].flat
-    input_matrix = np.empty((example.shape[0], len(preds)))
-    for j, pred in enumerate(preds):
-        input_matrix[:, j] = pred.flat.values[:, 0]
-    attrs = X.attrs.copy()
-    attrs['old_dims'] = [X[SOIL_MOISTURE].dims] * len(preds)
-    attrs['canvas'] = X[SOIL_MOISTURE].canvas
-    tags = [tag for tag, _ in models]
-    arr = xr.DataArray(input_matrix,
-                       coords=[('space', example.space),
-                               ('band', tags)],
-                       dims=('space', 'band'),
-                       attrs=attrs)
-    return xr.Dataset(dict(flat=arr), attrs=attrs)
-
-
-def ensemble_layer_2(pipe, **kw):
-    '''A simple model for the second layer (model on models).
-    RidgeCV is a good choice in the second layer since
-    colinearity is expected among the predictions from the
-    first layer that form an input matrix to the second layer'''
-    return [Pipeline([RidgeCV()], **pipeline_kw)]
-
-
-def train_model_on_models(last_hour_data, this_hour_data,
-                          init_func, nsga2_func=None):
-    '''Given input NLDAS FORA data from last hour and this hour,
-    train on the last hour and use the trained models to predict
-    the current hour's soil moisture
-
-    Parameters:
-
-        last_hour_data: Dataset from sampler() function above
-        this_hour_data: Dataset from sampler() function above, typically
-                        one hour later than last_hour_data
-        init_func:      Partial of ensemble_init_func that can
-                        be passed to the training function "ensemble"
-
-    Returns:
-        last_hour_data: See above
-        this_hour_data: See above
-        models:         First layer trained Pipelines on last_hour_data
-        preds:          First layer predictions from "models" on this_hour_data
-        models2:        Second layer trained Pipelines on last_hour_data
-        preds2:         Second layer predictions from "models2" on this_hour_data
-
-    '''
-    for hour in ('last', 'this'):
-        if hour == 'last':
-            X = last_hour_data
-        else:
-            X = this_hour_data
-        X_clean, true_y, _ = get_y(SOIL_MOISTURE,
-                                   drop_na_rows(flatten(X)))
-        if hour == 'last':
-            if nsga2_func:
-                models = nsga2_func()
-            else:
-                kw = dict(ensemble_init_func=init_func)
-                models = ensemble(None, ngen=NGEN, X=X,
-                                  ensemble_init_func=init_func,
-                                  model_selection=model_selection,
-                                  model_selection_kwargs=kw)
-        else:
-            preds = predict_many(dict(X=X),
-                                 ensemble=models)
-        X_second = second_layer_input_matrix(X, models)
-        X_second.attrs['drop_na_rows'] = X_clean.drop_na_rows
-        X_second.attrs['shape_before_drop_na_rows'] = X_clean.shape_before_drop_na_rows
-        if hour == 'last':
-            models2 = ensemble(None, ngen=1,
-                               X=X_second, y=true_y,
-                               ensemble_init_func=ensemble_layer_2)
-        else:
-            preds2 = predict_many(dict(X=X_second),
-                                  ensemble=models2)
-    return last_hour_data, this_hour_data, models, preds, models2, preds2
-
-
-def differencing_integrating(X, y=None, sample_weight=None,
-                             difference_cols=None,
-                             X_time_steps=X_TIME_STEPS,
-                             X_time_averaging=None):
-    if difference_cols is None:
-        difference_cols = DIFFERENCE_COLS
-    X = X.copy(deep=True)
-    X.attrs['band_order'] = X.band_order[:]
-    new_X = OrderedDict([(k, getattr(X, k)) for k in X.data_vars
-                          if k.startswith('hr_0_') or SOIL_MOISTURE == k])
-
-    assert len(X.data_vars) == len(X.band_order), repr((len(X.data_vars), len(X.band_order)))
-    band_order = list(new_X)
-    running_fields = []
-    running_diffs = []
-    last_hr = 0
-    for col in difference_cols:
-        for first_hr, second_hr in zip(X_time_averaging[:-1],
-                                       X_time_averaging[1:]):
-            for i in range(first_hr, second_hr):
-                end_period = 'hr_{}_{}'.format(first_hr, col)
-                start_period = 'hr_{}_{}'.format(second_hr, col)
-                end_array = X.data_vars[end_period]
-                start_array = X.data_vars[start_period]
-                running_fields.append(end_array)
-                diff = start_array - end_array
-                diff.attrs.update(start_array.attrs.copy())
-                running_diffs.append(diff)
-            diff_col_name = 'diff_{}_{}_{}'.format(first_hr, second_hr, col)
-            new_X[diff_col_name] = avg_arrs(*running_diffs)
-            running_diffs = []
-            new_X[start_period] = avg_arrs(*running_fields)
-            running_fields = []
-            band_order.extend((diff_col_name, end_period))
-    X = xr.Dataset(new_X, attrs=X.attrs)
-    X.attrs['band_order'] = band_order
-    assert len(X.data_vars) == len(X.band_order), repr((len(X.data_vars), len(X.band_order)))
-    return X, y, sample_weight
-
-
-def log_scaler(X, y=None, sample_weight=None, **kw):
+def log_trans_only_positive(X, y, **kw):
     Xnew = OrderedDict()
-    for j in range(X.flat.shape[1]):
-        minn = X.flat[:, j].min().values
+    for j in range(X.features.shape[1]):
+        minn = X.features[:, j].min().values
         if minn <= 0:
             continue
-        X.flat.values[:, j] = np.log10(X.flat.values[:, j])
-    return X, y, sample_weight
+        X.features.values[:, j] = np.log10(X.features.values[:, j])
+    return X, y
 
 
-def add_sample_weight(X, y=None, sample_weight=None, **kw):
-    '''Modify this function to return a sample_weight
-    if needed.  sample_weight returned should be a 1-D
-    NumPy array.  Currently it is weighting the pos/neg deviations.
-    '''
-    if kw.get('no_weights'):
-        return X, y, None
-    sample_weight = np.abs((y - y.mean()) / y.std())
-    return X, y, sample_weight
+class Flatten(Step):
+    def transform(self, X, y=None, **kw):
+        return X.to_features(), y
 
 
-pipeline_kw = dict(scoring=make_scorer(r_squared_mse))
-flat_step = ('flatten', steps.Flatten())
-drop_na_step = ('drop_null', steps.DropNaRows())
+class DropNaRows(Step):
+    def transform(self, X, y=None, **kw):
+        return X, y
 
-get_y_step = ('get_y', steps.ModifySample(partial(get_y, SOIL_MOISTURE)))
-robust = ('normalize', steps.RobustScaler(with_centering=False))
-standard = ('normalize', steps.StandardScaler(with_mean=False))
-minmax = lambda minn, maxx: ('MinMaxScaler',
-                             steps.MinMaxScaler(feature_range=(minn, maxx)))
-log = ('log', steps.ModifySample(log_scaler))
-def preamble(diff_kw=None, weights_kw=None):
-    diff_kw = diff_kw or {}
-    ms = steps.ModifySample(differencing_integrating, **diff_kw)
-    diff_in_time = ('diff_avg', ms)
-    pre = [diff_in_time,
-            flat_step,
-            drop_na_step,
-            get_y_step,]
-    if weights_kw is not None:
-        wts = ('weights', steps.ModifySample(add_sample_weight, **weights_kw))
-        return pre + [wts]
-    return pre
 
-linear = lambda: ('estimator', LinearRegression(n_jobs=-1))
-pca = lambda: ('pca', steps.Transform(PCA()))
-n_components = [None, 4, 6, 8, 10]
-minmax_bounds = [(0.01, 1.01), (0.05, 1.05),
-                 (0.1, 1.1), (0.2, 1.2),
-                 (1, 2),]
-minmax_scalers = [minmax(mn, mx) for mn, mx in minmax_bounds]
-other_scalers = [('RobustScaler', robust),
-                 ('StandardScaler', standard),
-                 ('None', None)]
-scalers = minmax_scalers + other_scalers
-estimators = zip(('LinearRegression', ),
-                 (linear, ))
+class Differencing(Step):
+    hours_back = 144
+    first_bin_width = 12
+    last_bin_width = 1
+    num_bins = 12
+    bin_shrink = 'linear'
+    reducers = 'mean'
+    layers = None
 
-tsteps_choices = [24, 48, 96, 144]
-# TODO turn this into a real valued
-# TODO
-few_days_ago = list(range(72, X_TIME_STEPS, 24))
-avg_scenario_0 = [0, 3, 6, 9, 12, 18, 24, 36, 48] + few_days_ago
-avg_scenario_1 = [0, 4, 8, 12, 18, 24, 36, 48] + few_days_ago
-avg_scenario_2 = [0, 6, 12, 24, 48] + few_days_ago
-avg_scenario_3 = [0, 2, 6, 12, 24, 48] + few_days_ago
-avg_scenario_4 = [0, 2, 12, 24, 72, few_days_ago[-1]]
-avg_scenario_5 = [0, 2, 24, 48] + few_days_ago
-avg_scenario_6 = [0, 6, 24, 48] + few_days_ago
-avg_scenarios = [avg_scenario_0,
-                 avg_scenario_1,
-                 avg_scenario_2,
-                 avg_scenario_3,
-                 avg_scenario_4,
-                 avg_scenario_5,
-                 avg_scenario_6,]
-diff_avg_hyper_params = [dict(X_time_steps=ts,
-                              X_time_averaging=[t for t in avg if t <= ts],
-                              difference_cols=DIFFERENCE_COLS)
-                         for ts in tsteps_choices
-                         for avg in avg_scenarios]
+    def transform(self, X, y=None, **kw):
+        return differencing_integrating(X, **self.get_params())
 
-def main():
-    '''
-    Beginning on START_DATE, step forward hourly, training on last
-    hour's NLDAS FORA dataset with transformers in a 2-layer hierarchical
-    ensemble, training on the last hour of data and making
-    out-of-training-sample predictions for the current hour.  Makes
-    a dill dump file for each hour run. Runs fro NSTEPS hour steps.
-    '''
-    date = START_DATE
-    get_file_name = lambda date: date.isoformat(
-                        ).replace(':','_').replace('-','_') + '.dill'
-    init_func = partial(ensemble_init_func,
-                        pca=pca,
-                        scalers=scalers,
-                        n_components=n_components,
-                        estimators=estimators,
-                        preamble=preamble,
-                        log=log,
-                        diff_avg_hyper_params=diff_avg_hyper_params,
-                        weights_kw=[dict(no_weights=True), dict()],
-                        summary='TODO fix')
-    for step in range(NSTEPS):
-        last_hour_data = sampler(date, X_time_steps=X_TIME_STEPS)
-        date += ONE_HR
-        this_hour_data = sampler(date, X_time_steps=X_TIME_STEPS)
-        current_file = get_file_name(date)
-        out = train_model_on_models(last_hour_data, this_hour_data, init_func)
-        dill.dump(out, open(current_file, 'wb'))
-        print('Dumped to:', current_file)
-        l2, t2, models, preds, models2, preds2 = out
-        layer_1_scores = [model._score for _, model in models]
-        layer_2_scores = [model._score for _, model in models2]
-        print('Scores in layer 1 models:', layer_1_scores)
-        print('Scores in layer 2 models:', layer_2_scores)
-    return last_hour_data, this_hour_data, models, preds, models2, preds2
 
-if __name__ == '__main__':
-    last_hour_data, this_hour_data, models, preds, models2, preds2 = main()
+SOIL_PHYS_CHEM = {}
+class AddSoilPhysicalChemical(Step):
+    add = True
+    soils_dset = None
+    to_raster = True
+    avg_cos_hyd_params = True
+    kw = None
+    def transform(self, X, y, **kw):
+        global SOIL_PHYS_CHEM
+        params['kw'] = params['kw'] or {}
+        params = self.get_params().copy()
+        if not params.pop('add'):
+            return X, y
+        hsh = hash(repr(params))
+        if hsh in SOIL_PHYS_CHEM:
+            soils = SOIL_PHYS_CHEM[hsh]
+        else:
+            soils = soil_features(**params)
+            if len(SOIL_PHYS_CHEM) < 3:
+                SOIL_PHYS_CHEM[hsh] = soils
+        return MLDataset(xr.merge(soils, X))
+
+SCALERS = [preprocessing.StandardScaler(), preprocessing.MinMaxScaler()]
+
+param_distributions = {
+    'scaler___estimator': SCALERS,
+    'scaler___trans': [log_trans_only_positive],
+    'pca__n_components': [6, 7, 8, 10, 14, 18],
+    'pca__estimator': [decomposition.PCA(),
+                      decomposition.FastICA(),
+                      decomposition.KernelPCA()],
+    'pca__run': [True, True, False],
+    'time__hours_back': [int(DEFAULT_MAX_STEPS / 2), DEFAULT_MAX_STEPS],
+    'time__last_bin_width': [1,],
+    'time__num_bins': [4,],
+    'time__weight_type': ['uniform', 'log', 'log', 'linear', 'linear'],
+    'time__bin_shrink': ['linear', 'log'],
+    'time__reducers': REDUCERS,
+    'soil_phys__add': [True, True, True, False],
+}
+
+model_selection = {
+    'select_method': 'selNSGA2',
+    'crossover_method': 'cxTwoPoint',
+    'mutate_method': 'mutUniformInt',
+    'init_pop': 'random',
+    'indpb': 0.5,
+    'mutpb': 0.9,
+    'cxpb':  0.3,
+    'eta':   20,
+    'ngen':  2,
+    'mu':    16,
+    'k':     8, # TODO ensure that k is not ignored - make elm issue if it is
+    'early_stop': None,
+}
+
+def get_file_name(tag, date):
+    date = date.isoformat().replace(':','_').replace('-','_')
+    return '{}-{}.dill'.format(tag, date)
+
+
+def dump(obj, tag, date):
+    fname = get_file_name(tag, date)
+    return getattr(obj, 'dump', getattr(obj, 'to_netcdf'))(fname)
+
+
+class Sampler(Step):
+    date = None
+    max_time_steps = DEFAULT_MAX_STEPS
+    def transform(self, X, y=None, **kw):
+        if X is None:
+            X = self.date
+        return slice_nldas_forcing_a(X, X_time_steps=DEFAULT_MAX_STEPS)
+
+max_time_steps = DEFAULT_MAX_STEPS // 2
+pipe = Pipeline([
+    ('sampler', Sampler(max_time_steps=max_time_steps)),
+    ('time', Differencing(layers=FEATURE_LAYERS)),
+    ('flatten', Flatten()),
+    ('soil_phys', AddSoilPhysicalChemical()),
+    ('drop_null', DropNaRows()),
+    ('get_y', GetY(SOIL_MOISTURE)),
+    ('None', None)
+])
+
+
+X, y = pipe.fit_transform(START_DATE)
+
+pipe = Pipeline([
+        ('scaler', ChooseWithPreproc(trans_if=log_trans_only_positive)),
+        ('pca', ChooseWithPreproc()),
+        ('estimator', linear_model.LinearRegression(n_jobs=-1))])
+
+
+
+date = START_DATE
+dates = np.array([START_DATE - datetime.timedelta(hours=hr)
+                 for hr in range(3)])
+splits = list(KFold(DEFAULT_CV).split(dates))
+
+cv = CVCacheSampleId(splits, sampler, pairwise=True, cache=True)
+ea = EaSearchCV(pipe,
+                param_distributions=param_distributions,
+                #cv_split=partial(cv_split, sampler),
+                ngen=NGEN,
+                model_selection=model_selection,
+                cv=cv)
+
+Xt, y = pipe.fit_transform(X)
+
+print(ea.get_params())
+date += ONE_HR
+#print(ea.get_params())
+current_file = get_file_name('fit_model', date)
+ea.fit(dates)
+dump(ea, tag, date)
+estimators.append(ea)
+second_layer = MultiLayer(estimator=linear_model.LinearRegression,
+                          estimators=estimators)
+second_layer.fit(X)
+pred = ea.predict(X)
+  #  return (ea, X, second_layer,
+   #         pred, pred_layer_2, pred_avg,
+    #        date, current_file)
+
+
+#if __name__ == '__main__':
+    #ea, X, second_layer, pred, pred_layer_2, pred_avg = main()
 

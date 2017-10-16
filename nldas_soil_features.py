@@ -6,7 +6,7 @@ from read_nldas_soils import SOIL_META, read_nldas_soils
 _endswith = lambda x, end: x.endswith('_{}'.format(end))
 
 def _avg_cos_hyd_params(soils_dset, attrs=None):
-
+    from ts_raster_steps import reduce_series
     attrs = attrs or soils_dset.attrs.copy(deep=True)
     skip = ('i', 'j', 'x', 'y', 'unknown')
     keep = [x[0] for x in SOIL_META['COS_HYD']
@@ -16,23 +16,13 @@ def _avg_cos_hyd_params(soils_dset, attrs=None):
                        if _endswith(k, keep2)])
               for keep2 in keep]
     for array_label, keys in groups:
-        arrs[array_label] = avg_arrs(*(soils_dset[k] for k in keys))
+        arr = reduce_series('mean', [1] * len(keys),
+                            tuple(soils_dset[k] for k in keys))
+        arrs[array_label] = arr
     for array_label, arr in soils_dset.data_vars.items():
         if not any(_endswith(array_label, keep2) in x for x in keep):
             arrs[array_label] = arr
     return xr.Dataset(arrs, attrs=attrs)
-
-
-def avg_arrs(*arrs):
-    '''Take the mean of a variable number of xarray.DataArray objects and
-    keep metadata from the first DataArray given'''
-    s = arrs[0]
-    if len(arrs) > 1:
-        for a in arrs[1:]:
-            s += a
-    s = s / float(len(arrs))
-    s.attrs.update(arrs[0].attrs)
-    return s
 
 
 def flatten_layers(soils_dset, attrs=None):
@@ -51,10 +41,10 @@ def flatten_layers(soils_dset, attrs=None):
     return xr.Dataset(arrs, attrs=attrs)
 
 
-def soil_features(soils_dset=None,
-                   to_raster=True,
-                   avg_cos_hyd_params=True,
-                   **kw):
+def nldas_soil_features(soils_dset=None,
+                        to_raster=True,
+                        avg_cos_hyd_params=True,
+                        **kw):
 
     if soils_dset is None:
         soils_dset = read_nldas_soils(**kw)
@@ -72,4 +62,4 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Read NLDAS inputs-related soil data from https://ldas.gsfc.nasa.gov/nldas/NLDASsoils.php')
     parser.add_argument('--to-raster', action='store_true')
     parser.add_argument('--avg-cos-hyd-params', action='store_true')
-    soils_dset = soil_features(**vars(parser.parse_args()))
+    soils_dset = nldas_soil_features(**vars(parser.parse_args()))
