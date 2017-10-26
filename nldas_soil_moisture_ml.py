@@ -15,8 +15,6 @@ from elm.pipeline.steps import (linear_model,
 from elm.pipeline.predict_many import predict_many
 from sklearn.metrics import r2_score, mean_squared_error, make_scorer
 from elm.model_selection.sorting import pareto_front
-from sklearn.model_selection import KFold
-from elm.mldataset.cv_cache import CVCacheSampleId, cv_split
 from elm.model_selection import EaSearchCV
 import numpy as np
 from xarray_filters import MLDataset
@@ -33,10 +31,12 @@ NGEN = 3
 NSTEPS = 1
 WATER_MASK = -9999
 DEFAULT_CV = 5
+X_TIME_STEPS = 144
 
+BASE_URL = 'https://hydro1.gesdisc.eosdis.nasa.gov/data/NLDAS/{}/{:04d}/{:03d}/{}'
 START_DATE = datetime.datetime(2000, 1, 1, 1, 0, 0)
 
-DEFAULT_MAX_STEPS = 3
+DEFAULT_MAX_STEPS = 144
 ONE_HR = datetime.timedelta(hours=1)
 TIME_OPERATIONS = ('mean',
                    'std',
@@ -103,7 +103,7 @@ class AddSoilPhysicalChemical(Step):
                 SOIL_PHYS_CHEM[hsh] = soils
         return MLDataset(xr.merge(soils, X))
 
-SCALERS = [preprocessing.StandardScaler(), preprocessing.MinMaxScaler()]
+SCALERS = [preprocessing.StandardScaler()] + [preprocessing.MinMaxScaler()] * 10
 
 param_distributions = {
     'scaler___estimator': SCALERS,
@@ -134,7 +134,7 @@ model_selection = {
     'ngen':  2,
     'mu':    16,
     'k':     8, # TODO ensure that k is not ignored - make elm issue if it is
-    'early_stop': None,
+    'early_stop': None
 }
 
 def get_file_name(tag, date):
@@ -147,50 +147,70 @@ def dump(obj, tag, date):
     return getattr(obj, 'dump', getattr(obj, 'to_netcdf'))(fname)
 
 
+def main(date=START_DATE, cv=DEFAULT_CV):
+    '''
+    Beginning on START_DATE, step forward hourly, training on last
+    hour's NLDAS FORA dataset with transformers in a 2-layer hierarchical
+    ensemble, training on the last hour of data and making
+    out-of-training-sample predictions for the current hour.  Makes
+    a dill dump file for each hour run. Runs fro NSTEPS hour steps.
+    '''
+    estimators = []
+    for step in range(NSTEPS):
+        out = train_one_time_step(date,
+                                  cv=DEFAULT_CV,
+                                  estimators=estimators)
+        ea, X, second_layer, pred, pred_layer_2, pred_avg = out
+        scores = pd.DataFrame(ea.cv_results_)
+        scores.to_pickle(get_file_name('scores', date))
+        pred.to_netcdf(get_file_name('pred_layer_1', date))
+        pred_layer_2 = second_layer.predict(X)
+        pred_layer_2.to_netcdf(get_file_name('pred_layer_2', date))
+        pred_avg = (pred + pred_layer_2) / 2.
+        pred_avg.to_netcdf(get_file_name('pred_avg', date))
+    return ea, X, second_layer, pred, pred_layer_2, pred_avg
+
 class Sampler(Step):
     date = None
-    max_time_steps = DEFAULT_MAX_STEPS
     def transform(self, X, y=None, **kw):
         if X is None:
             X = self.date
-        return slice_nldas_forcing_a(X, X_time_steps=DEFAULT_MAX_STEPS)
-
-max_time_steps = DEFAULT_MAX_STEPS // 2
-pipe = Pipeline([
-    ('sampler', Sampler(max_time_steps=max_time_steps)),
-    ('time', Differencing(layers=FEATURE_LAYERS)),
-    ('flatten', Flatten()),
-    ('soil_phys', AddSoilPhysicalChemical()),
-    ('drop_null', DropNaRows()),
-    ('get_y', GetY(SOIL_MOISTURE)),
-    ('None', None)
-])
+        return slice_nldas_forcing_a(X, X_time_steps=max_time_steps)
 
 
-X, y = pipe.fit_transform(START_DATE)
-
-pipe = Pipeline([
+def new_ea_search_pipeline(splits, y_layer=SOIL_MOISTURE, cv=DEFAULT_CV):
+    #X, y = pipe.fit()
+    pipe = Pipeline([
+        ('time', Differencing(layers=FEATURE_LAYERS)),
+        ('flatten', Flatten()),
+        ('soil_phys', AddSoilPhysicalChemical()),
+        ('drop_null', DropNaRows()),
+        ('get_y', GetY(y_layer)),
         ('scaler', ChooseWithPreproc(trans_if=log_trans_only_positive)),
         ('pca', ChooseWithPreproc()),
         ('estimator', linear_model.LinearRegression(n_jobs=-1))])
 
+    ea = EaSearchCV(pipe,
+                    param_distributions=param_distributions,
+                    sampler=Sampler(),
+                    ngen=NGEN,
+                    model_selection=model_selection,
+                    cv=cv)
+    return ea
 
+from sklearn.model_selection import KFold
 
+max_time_steps = DEFAULT_MAX_STEPS // 2
 date = START_DATE
 dates = np.array([START_DATE - datetime.timedelta(hours=hr)
-                 for hr in range(3)])
+                 for hr in range(max_time_steps)])
 splits = list(KFold(DEFAULT_CV).split(dates))
 
-cv = CVCacheSampleId(splits, sampler, pairwise=True, cache=True)
-ea = EaSearchCV(pipe,
-                param_distributions=param_distributions,
-                #cv_split=partial(cv_split, sampler),
-                ngen=NGEN,
-                model_selection=model_selection,
-                cv=cv)
+#dummy_X = np.random.uniform(0, 1, (1000, 2))
+#dummy_y = np.random.uniform(0, 1, (1000,))
 
-Xt, y = pipe.fit_transform(X)
 
+ea = new_ea_search_pipeline(splits)
 print(ea.get_params())
 date += ONE_HR
 #print(ea.get_params())
