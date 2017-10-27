@@ -14,6 +14,7 @@ from elm.pipeline.steps import (linear_model,
                                 preprocessing)
 from elm.pipeline.predict_many import predict_many
 from sklearn.metrics import r2_score, mean_squared_error, make_scorer
+from sklearn.model_selection import StratifiedShuffleSplit
 from elm.model_selection.sorting import pareto_front
 from elm.model_selection import EaSearchCV
 import numpy as np
@@ -178,44 +179,44 @@ class Sampler(Step):
         return slice_nldas_forcing_a(X, X_time_steps=max_time_steps)
 
 
-def new_ea_search_pipeline(splits, y_layer=SOIL_MOISTURE, cv=DEFAULT_CV):
-    #X, y = pipe.fit()
-    pipe = Pipeline([
-        ('time', Differencing(layers=FEATURE_LAYERS)),
-        ('flatten', Flatten()),
-        ('soil_phys', AddSoilPhysicalChemical()),
-        ('drop_null', DropNaRows()),
-        ('get_y', GetY(y_layer)),
-        ('scaler', ChooseWithPreproc(trans_if=log_trans_only_positive)),
-        ('pca', ChooseWithPreproc()),
-        ('estimator', linear_model.LinearRegression(n_jobs=-1))])
+def make_cross_val(dates, by=('day',), n_splits=3, test_size=4, train_size=4):
+    sss = StratifiedShuffleSplit(n_splits=n_splits,
+                                 test_size=test_size,
+                                 train_size=train_size)
+    date_groups = [tuple(getattr(date, part) for part in by) for d in dates]
+    return sss, date_groups
 
-    ea = EaSearchCV(pipe,
-                    param_distributions=param_distributions,
-                    sampler=Sampler(),
-                    ngen=NGEN,
-                    model_selection=model_selection,
-                    cv=cv)
-    return ea
-
-from sklearn.model_selection import KFold
 
 max_time_steps = DEFAULT_MAX_STEPS // 2
 date = START_DATE
 dates = np.array([START_DATE - datetime.timedelta(hours=hr)
                  for hr in range(max_time_steps)])
-splits = list(KFold(DEFAULT_CV).split(dates))
 
-#dummy_X = np.random.uniform(0, 1, (1000, 2))
-#dummy_y = np.random.uniform(0, 1, (1000,))
+pipe = Pipeline([
+    ('time', Differencing(layers=FEATURE_LAYERS)),
+    ('flatten', Flatten()),
+    ('soil_phys', AddSoilPhysicalChemical()),
+    ('drop_null', DropNaRows()),
+    ('get_y', GetY(SOIL_MOISTURE)),
+    ('scaler', ChooseWithPreproc(trans_if=log_trans_only_positive)),
+    ('pca', ChooseWithPreproc()),
+    ('estimator', linear_model.LinearRegression(n_jobs=-1)),
+])
 
+sss, date_groups = make_cross_val(dates)
+ea = EaSearchCV(pipe,
+                param_distributions=param_distributions,
+                sampler=Sampler(),
+                ngen=NGEN,
+                model_selection=model_selection,
+                cv=sss)
 
-ea = new_ea_search_pipeline(splits)
 print(ea.get_params())
+ea.fit(dates, groups=date_groups)
+
 date += ONE_HR
-#print(ea.get_params())
 current_file = get_file_name('fit_model', date)
-ea.fit(dates)
+
 dump(ea, tag, date)
 estimators.append(ea)
 second_layer = MultiLayer(estimator=linear_model.LinearRegression,
