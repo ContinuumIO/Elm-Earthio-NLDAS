@@ -174,16 +174,27 @@ def main(date=START_DATE, cv=DEFAULT_CV):
 class Sampler(Step):
     date = None
     def transform(self, X, y=None, **kw):
+        print('transform', X, y, kw)
         if X is None:
             X = self.date
         return slice_nldas_forcing_a(X, X_time_steps=max_time_steps)
 
+class CVWrap(StratifiedShuffleSplit):
+    def split(self, *a, **kw):
+        splits = super(CVWrap, self).split(*a, **kw)
+        for test, train in splits:
+            for a, b in zip(test, train):
+                yield a, b
+
 
 def make_cross_val(dates, by=('day',), n_splits=3, test_size=4, train_size=4):
-    sss = StratifiedShuffleSplit(n_splits=n_splits,
-                                 test_size=test_size,
-                                 train_size=train_size)
+    sss = CVWrap(n_splits=n_splits,
+                 test_size=test_size,
+                 train_size=train_size)
     date_groups = [tuple(getattr(date, part) for part in by) for d in dates]
+    '''    splits = tuple((a, b)
+                   for test, train in sss.split(x, np.random.randint(0, 1, (10000,)))
+                   for a, b in zip(test, train))'''
     return sss, date_groups
 
 
@@ -212,7 +223,7 @@ ea = EaSearchCV(pipe,
                 cv=sss)
 
 print(ea.get_params())
-ea.fit(dates, groups=date_groups)
+ea.fit(dates, y=date_groups)
 
 date += ONE_HR
 current_file = get_file_name('fit_model', date)
@@ -223,11 +234,3 @@ second_layer = MultiLayer(estimator=linear_model.LinearRegression,
                           estimators=estimators)
 second_layer.fit(X)
 pred = ea.predict(X)
-  #  return (ea, X, second_layer,
-   #         pred, pred_layer_2, pred_avg,
-    #        date, current_file)
-
-
-#if __name__ == '__main__':
-    #ea, X, second_layer, pred, pred_layer_2, pred_avg = main()
-
