@@ -1,4 +1,5 @@
 from __future__ import print_function, unicode_literals, division
+import dask
 
 from collections import OrderedDict
 import datetime
@@ -14,7 +15,7 @@ from elm.pipeline.steps import (linear_model,
                                 preprocessing)
 from elm.pipeline.predict_many import predict_many
 from sklearn.metrics import r2_score, mean_squared_error, make_scorer
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import KFold
 from elm.model_selection.sorting import pareto_front
 from elm.model_selection import EaSearchCV
 import numpy as np
@@ -31,13 +32,11 @@ from changing_structure import ChooseWithPreproc
 NGEN = 3
 NSTEPS = 1
 WATER_MASK = -9999
-DEFAULT_CV = 5
-X_TIME_STEPS = 144
+DEFAULT_CV = 3
+DEFAULT_MAX_STEPS = 12
 
-BASE_URL = 'https://hydro1.gesdisc.eosdis.nasa.gov/data/NLDAS/{}/{:04d}/{:03d}/{}'
 START_DATE = datetime.datetime(2000, 1, 1, 1, 0, 0)
 
-DEFAULT_MAX_STEPS = 144
 ONE_HR = datetime.timedelta(hours=1)
 TIME_OPERATIONS = ('mean',
                    'std',
@@ -88,10 +87,8 @@ class AddSoilPhysicalChemical(Step):
     soils_dset = None
     to_raster = True
     avg_cos_hyd_params = True
-    kw = None
     def transform(self, X, y, **kw):
         global SOIL_PHYS_CHEM
-        params['kw'] = params['kw'] or {}
         params = self.get_params().copy()
         if not params.pop('add'):
             return X, y
@@ -114,7 +111,7 @@ param_distributions = {
                       decomposition.FastICA(),
                       decomposition.KernelPCA()],
     'pca__run': [True, True, False],
-    'time__hours_back': [int(DEFAULT_MAX_STEPS / 2), DEFAULT_MAX_STEPS],
+    'time__hours_back': list(np.linspace(1, DEFAULT_MAX_STEPS, 12).astype(np.int32)),
     'time__last_bin_width': [1,],
     'time__num_bins': [4,],
     'time__weight_type': ['uniform', 'log', 'log', 'linear', 'linear'],
@@ -173,29 +170,13 @@ def main(date=START_DATE, cv=DEFAULT_CV):
 
 class Sampler(Step):
     date = None
-    def transform(self, X, y=None, **kw):
-        print('transform', X, y, kw)
-        if X is None:
-            X = self.date
-        return slice_nldas_forcing_a(X, X_time_steps=max_time_steps)
+    def transform(self, dates, y=None, **kw):
+        print('transform', dates, y, kw)
+        dsets = [slice_nldas_forcing_a(date, X_time_steps=max_time_steps)
+                 for date in dates[:1]]
+        feats = [dset.to_features().features for dset in dsets]
+        return MLDataset(OrderedDict([('features', xr.concat(feats))]))
 
-class CVWrap(StratifiedShuffleSplit):
-    def split(self, *a, **kw):
-        splits = super(CVWrap, self).split(*a, **kw)
-        for test, train in splits:
-            for a, b in zip(test, train):
-                yield a, b
-
-
-def make_cross_val(dates, by=('day',), n_splits=3, test_size=4, train_size=4):
-    sss = CVWrap(n_splits=n_splits,
-                 test_size=test_size,
-                 train_size=train_size)
-    date_groups = [tuple(getattr(date, part) for part in by) for d in dates]
-    '''    splits = tuple((a, b)
-                   for test, train in sss.split(x, np.random.randint(0, 1, (10000,)))
-                   for a, b in zip(test, train))'''
-    return sss, date_groups
 
 
 max_time_steps = DEFAULT_MAX_STEPS // 2
@@ -214,17 +195,17 @@ pipe = Pipeline([
     ('estimator', linear_model.LinearRegression(n_jobs=-1)),
 ])
 
-sss, date_groups = make_cross_val(dates)
 ea = EaSearchCV(pipe,
                 param_distributions=param_distributions,
                 sampler=Sampler(),
                 ngen=NGEN,
                 model_selection=model_selection,
-                cv=sss)
-
+                scheduler=None,
+                refit_Xy=Sampler().fit_transform([START_DATE]),
+                cv=KFold(3))
 print(ea.get_params())
-ea.fit(dates, y=date_groups)
-
+ea.fit(dates)
+'''
 date += ONE_HR
 current_file = get_file_name('fit_model', date)
 
@@ -234,3 +215,4 @@ second_layer = MultiLayer(estimator=linear_model.LinearRegression,
                           estimators=estimators)
 second_layer.fit(X)
 pred = ea.predict(X)
+'''

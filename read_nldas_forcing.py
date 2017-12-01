@@ -16,6 +16,8 @@ from xarray_filters import MLDataset
 from xarray_filters.pipeline import Step
 
 
+META_URL = 'https://cmr.earthdata.nasa.gov/search/granules.json?echo_collection_id=C1233767589-GES_DISC&sort_key%5B%5D=-start_date&page_size=20'
+
 VIC, FORA = ('NLDAS_VIC0125_H', 'NLDAS_FORA0125_H',)
 
 SOIL_MOISTURE = 'SOIL_M_110_DBLY'
@@ -36,8 +38,7 @@ VIC, FORA = ('NLDAS_VIC0125_H', 'NLDAS_FORA0125_H',)
 WATER_MASK = -9999
 
 BASE_URL = 'https://hydro1.gesdisc.eosdis.nasa.gov/data/NLDAS/{}/{:04d}/{:03d}/{}'
-
-
+BASE_URL = 'https://hydro1.gesdisc.eosdis.nasa.gov/data/NLDAS/{}/{:04d}/{:03d}/{}'
 
 def get_session():
     username = os.environ.get('NLDAS_USERNAME') or raw_input('NLDAS Username: ')
@@ -81,6 +82,7 @@ def get_file(date, name, **kw):
     '''
     year, month, day, hour = date.year, date.month, date.day, date.hour
     url, rel = make_url(year, month, day, hour, name, **kw)
+    print('url', url, rel)
     path, basename = os.path.split(rel)
     if not os.path.exists(rel):
         if not os.path.exists(path):
@@ -103,9 +105,10 @@ def slice_nldas_forcing_a(date, X_time_steps=144, feature_layers=None, **kw):
     for hours_ago in range(X_time_steps):
         file_time = date - datetime.timedelta(hours=hours_ago)
         dates.append(file_time)
-    paths = [get_file(date, name='FORA') for date in dates]
+    paths = [get_file(date, name=FORA) for date in dates]
+    print('paths', paths)
     fora = xr.open_mfdataset(paths, engine='pynio')
-    path = get_file(date, name='VIC')
+    path = get_file(date, name=VIC)
     vic  = xr.open_dataset(date, engine='pynio')
     return MLDataset(xr.merge((vic, fora)))
 
