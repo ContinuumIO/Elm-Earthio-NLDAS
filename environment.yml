@@ -1,0 +1,64 @@
+name: ds-elm
+channels:
+ - bokeh
+ - conda-forge
+ - ioam
+
+dependencies:
+ - beautifulsoup4
+ - conda-forge::bokeh
+ - cartopy
+ - colorcet
+ - conda-forge::graphviz
+ - conda-forge::pytest
+ - conda-forge::pytest-benchmark
+ - conda-forge::python-graphviz
+ - dask>=0.15.4
+ - datashader
+ - dill
+ - distributed
+ - elm/label/dev::earthio
+ - elm/label/dev::elm
+ - fastparquet
+ - flake8
+ - conda-forge::xarray>=0.9.6
+ - gdal=2.1
+ - conda-forge::geoviews
+ - conda-forge::holoviews>=1.9.0
+ - ipython
+ - iris
+ - jupyter
+ - jupyter_dashboards
+ - krb5
+ - matplotlib
+ - nbconvert
+ - nbformat
+ - networkx>=2.0
+ - numba
+ - numpy
+ - pandas
+ - ioam::param>=1.5.1
+ - ioam::paramnb
+ - pydap
+ - ncar::pynio=dev
+ - pyproj
+ - pycurl
+ - pytables
+ - pytest
+ - python-snappy
+ - python=3.6
+ - rasterio
+ - requests
+ - scikit-image
+ - scipy
+ - shapely
+ - snappy
+ - statsmodels
+ - tblib
+ - elm/label/dev::xarray_filters
+ - yaml
+ - pip:
+   - cachey
+   - streamz==0.2.0
+   - webargs
+
